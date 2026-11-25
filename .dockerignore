@@ -1,0 +1,6 @@
+# Keep secrets and the (large) WordPress document root out of the build context.
+.env
+.env.*
+!.env.example
+html
+.git

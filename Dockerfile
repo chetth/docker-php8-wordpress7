@@ -1,4 +1,16 @@
-FROM php:8.4-fpm-alpine3.22
+# Exact versions are pinned so every image can be checked against CVE advisories.
+# A floating tag (e.g. 8.4-fpm-alpine3.22) silently stops receiving patches once
+# upstream drops that Alpine release. To upgrade: bump these, then
+# `docker compose build --pull`.
+#
+# 8.5.13 (2026-11-19) carries the same November 2026 security fixes as 8.6.0.
+# 8.6 is not used yet: the latest releases of imagick (3.8.1), redis (6.3.0)
+# and memcached (3.4.0) do not compile against it, and the php:8.6 images no
+# longer ship `pecl` (use PIE: https://github.com/php/pie). Move to 8.6 once
+# those extensions publish compatible releases.
+ARG PHP_VERSION=8.5.13
+ARG ALPINE_VERSION=3.24
+FROM php:${PHP_VERSION}-fpm-alpine${ALPINE_VERSION}
 
 #### PHP extensions ##############################
 RUN apk add --update --no-cache --virtual .ext-deps \
@@ -12,23 +24,28 @@ RUN apk add --update --no-cache --virtual .ext-deps \
         libzip-dev imagemagick-dev \
         libjpeg-turbo-dev libjpeg libjpeg-turbo \
         icu-dev \
+        oniguruma-dev \
         linux-headers
 
+# PHP >= 8.5 compiles OPcache into the core, so it is no longer installed here.
+# WordPress needs mbstring for multibyte (e.g. Thai) text. It is built into the
+# 8.5 images; the php:8.6 images dropped it, so build it only when missing.
 RUN \
     docker-php-ext-configure pdo_mysql && \
-    docker-php-ext-configure opcache && \
     docker-php-ext-configure exif && \
     docker-php-ext-configure zip && \
     docker-php-ext-configure gd --with-freetype --with-jpeg && \
     docker-php-ext-configure sockets && \
     docker-php-ext-configure intl && \
-    docker-php-ext-install pdo_mysql opcache exif gd sockets mysqli calendar intl zip
+    docker-php-ext-install pdo_mysql exif gd sockets mysqli calendar intl zip && \
+    { php -m | grep -qx mbstring || docker-php-ext-install mbstring; }
 
+# Pinned for reproducible builds; bump deliberately.
 RUN \
-    pecl install redis && \
-    pecl install mongodb && \
-    pecl install memcached && \
-    pecl install imagick && \
+    pecl install redis-6.3.0 && \
+    pecl install mongodb-2.5.8 && \
+    pecl install memcached-3.4.0 && \
+    pecl install imagick-3.8.1 && \
     pecl clear-cache && \
     docker-php-ext-enable redis.so && \
     docker-php-ext-enable mongodb.so && \
@@ -38,7 +55,12 @@ RUN \
     docker-php-source delete
 
 ####  Setup OpenResty ###################
-ENV OPENRESTY_VERSION=1.31.1.1
+# 1.31.9.1 (2026-11-23) bundles nginx 1.31.9, which fixes CVE-2026-123007,
+# CVE-2026-123633, CVE-2026-121810 and the other nginx 1.31.9 advisories.
+# SHA256 taken from a tarball whose PGP signature was verified against
+# OpenResty's release key (A0E98066, Yichun Zhang).
+ENV OPENRESTY_VERSION=1.31.9.1
+ENV OPENRESTY_SHA256=71d49935bdc186dafc1f4b0a8ba44dba1bf4abc8ca52d4621f2039ec8fdcc95f
 ENV OPENRESTY_PREFIX=/opt/openresty
 ENV NGINX_PREFIX=/opt/openresty/nginx
 ENV NGINX_CONF=/opt/openresty/nginx/conf
@@ -64,9 +86,10 @@ RUN echo "==> Installing dependencies..." \
  && mkdir -p /root/ngx_openresty \
  && cd /root/ngx_openresty \
  && echo "==> Downloading OpenResty..." \
- && curl -fsSL https://github.com/FRiCKLE/ngx_cache_purge/archive/2.3.tar.gz | tar -zxv \
- && curl -fsSL https://openresty.org/download/openresty-${OPENRESTY_VERSION}.tar.gz | tar -xvz \
- && cd openresty-* \
+ && curl -fsSL -o openresty.tar.gz https://openresty.org/download/openresty-${OPENRESTY_VERSION}.tar.gz \
+ && echo "${OPENRESTY_SHA256}  openresty.tar.gz" | sha256sum -c - \
+ && tar -xzf openresty.tar.gz \
+ && cd openresty-${OPENRESTY_VERSION} \
  && echo "==> Configuring OpenResty..." \
  && NPROC=$(grep -c ^processor /proc/cpuinfo 2>/dev/null || echo 1) \
  && echo "using upto $NPROC threads" \
@@ -78,11 +101,11 @@ RUN echo "==> Installing dependencies..." \
     --error-log-path=$VAR_LOG_PREFIX/error.log \
     --pid-path=$VAR_PREFIX/nginx.pid \
     --lock-path=$VAR_PREFIX/nginx.lock \
-    --add-module=/root/ngx_openresty/ngx_cache_purge-2.3 \
     --with-luajit \
     --with-pcre-jit \
     --with-ipv6 \
     --with-http_stub_status_module \
+    --with-http_realip_module \
     --with-http_ssl_module \
     --with-http_flv_module \
     --with-http_v2_module \
@@ -121,10 +144,30 @@ ONBUILD COPY nginx $NGINX_PREFIX/
 
 RUN echo '<?php if(isset($_REQUEST["printinfo"])) phpinfo();' > /var/www/html/index.php \
  && echo '?><a href=/?printinfo>see phpinfo()</a>' >> /var/www/html/index.php
+
+#### PHP / PHP-FPM configuration ################
+# PHP-FPM pool sizing, read by www.conf. Defaults suit a host with ~2-4 GB RAM
+# for PHP; override per host in docker-compose.yml (see www.conf for sizing).
+ENV PHP_FPM_PM=dynamic \
+    PHP_FPM_MAX_CHILDREN=20 \
+    PHP_FPM_START_SERVERS=4 \
+    PHP_FPM_MIN_SPARE_SERVERS=2 \
+    PHP_FPM_MAX_SPARE_SERVERS=6 \
+    PHP_FPM_MAX_REQUESTS=500
+
+RUN cp "$PHP_INI_DIR/php.ini-production" "$PHP_INI_DIR/php.ini" \
+ && mkdir -p /run/php-fpm
+COPY ./php-production.ini $PHP_INI_DIR/conf.d/zz-production.ini
+COPY ./www.conf /usr/local/etc/php-fpm.d/www.conf
+
 ADD  ./start.sh /start.sh
 COPY ./nginx.conf ${NGINX_CONF}/nginx.conf
 RUN chmod +x /start.sh
 
 EXPOSE 80
 
-ENTRYPOINT ["/start.sh",""]
+# Exercises nginx -> FastCGI -> PHP-FPM end to end.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+    CMD curl -fsS http://127.0.0.1/fpm-ping || exit 1
+
+ENTRYPOINT ["/start.sh"]
